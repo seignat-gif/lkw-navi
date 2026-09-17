@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>LKW Navi 40t – v1.0</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="manifest" href="./manifest.webmanifest">
+<style>
+html,body,#map{height:100%;margin:0;font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif}
+#map{position:fixed;inset:0}
+.panel{position:fixed;z-index:1000;left:14px;right:14px;top:max(14px,env(safe-area-inset-top));background:#fff;padding:15px;border-radius:18px;box-shadow:0 3px 18px #0003;max-width:720px;margin:auto}
+h1{font-size:23px;margin:0 0 6px}.profile{color:#555;margin-bottom:10px}
+input{box-sizing:border-box;width:100%;font-size:18px;padding:13px;border:1px solid #bbb;border-radius:12px}
+.row{display:flex;gap:8px;margin-top:9px}.row button{flex:1}
+button{border:0;border-radius:12px;padding:13px 10px;font-size:17px;font-weight:700;background:#111;color:#fff}
+button.secondary{background:#e9edf2;color:#1475e8}
+button:disabled{opacity:.4}
+#status{margin-top:10px;font-size:15px}
+#summary{margin-top:8px;font-size:15px;max-height:180px;overflow:auto}
+#drive{display:none;position:fixed;z-index:1400;left:12px;right:12px;bottom:max(18px,env(safe-area-inset-bottom));background:#fff;border-radius:18px;padding:13px;box-shadow:0 3px 18px #0003}
+#next{font-size:21px;font-weight:800}#dist{font-size:16px;margin-top:3px}
+.driveBtns{display:flex;gap:8px;margin-top:9px}.driveBtns button{flex:1}
+.ok{color:#187b35}.warn{color:#a45b00}.bad{color:#b00020}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+<h1>🚛 LKW NAVI <small>v1.0</small></h1>
+<div class="profile">40 t · 4,00 m · 2,55 m · 16,50 m</div>
+<input id="dest" value="Am Graben 16, 97355 Kleinlangheim" placeholder="Zieladresse">
+<div class="row"><button id="loc" class="secondary">📍 Standort</button><button id="route" disabled>Route berechnen</button></div>
+<div class="row"><button id="start" disabled>▶ Navigation starten</button></div>
+<div id="status">Standort noch nicht gesetzt.</div>
+<div id="summary"></div>
+</div>
+<div id="drive">
+<div id="next">Navigation</div><div id="dist"></div>
+<div class="driveBtns"><button id="center">🎯</button><button id="voice">🔊</button><button id="stop">⏹ Beenden</button></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const map=L.map('map').setView([49.75,10.2],10);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
+
+let startPos=null, routeCoords=[], maneuvers=[], routeLine=null, marker=null;
+let watchId=null, navigating=false, voiceOn=true, lastSpoken=-1, userMoved=false;
+
+function setStatus(t,c=''){ $('status').className=c; $('status').textContent=t; }
+function setStart(lat,lon,acc){
+ startPos={lat,lon};
+ if(!marker) marker=L.marker([lat,lon]).addTo(map).bindPopup('Standort');
+ else marker.setLatLng([lat,lon]);
+ if(!navigating) map.setView([lat,lon],15);
+ $('route').disabled=false;
+ setStatus('Standort gesetzt'+(acc?` (±${Math.round(acc)} m)`:'')+'.','ok');
+}
+function getLocation(){
+ if(!navigator.geolocation){setStatus('GPS wird von diesem Browser nicht unterstützt.','bad');return;}
+ setStatus('Standort wird bestimmt…','warn');
+ navigator.geolocation.getCurrentPosition(
+  p=>{
+   setStart(p.coords.latitude,p.coords.longitude,p.coords.accuracy);
+   navigator.geolocation.getCurrentPosition(
+    q=>setStart(q.coords.latitude,q.coords.longitude,q.coords.accuracy),
+    ()=>{},
+    {enableHighAccuracy:true,timeout:10000,maximumAge:0}
+   );
+  },
+  e=>setStatus('Standort nicht verfügbar: '+e.message,'bad'),
+  {enableHighAccuracy:false,timeout:6000,maximumAge:60000}
+ );
+}
+$('loc').onclick=getLocation;
+
+async function geocode(q){
+ const u='https://nominatim.openstreetmap.org/search?format=json&limit=1&q='+encodeURIComponent(q);
+ const r=await fetch(u,{headers:{'Accept':'application/json'}});
+ if(!r.ok) throw Error('Zielsuche fehlgeschlagen');
+ const a=await r.json(); if(!a.length) throw Error('Zieladresse nicht gefunden');
+ return {lat:+a[0].lat,lon:+a[0].lon};
+}
+function decode(str,precision=6){
+ let index=0,lat=0,lng=0,out=[],factor=Math.pow(10,precision);
+ while(index<str.length){
+  let b,shift=0,result=0; do{b=str.charCodeAt(index++)-63;result|=(b&31)<<shift;shift+=5}while(b>=32);
+  lat+=(result&1)?~(result>>1):(result>>1); shift=0;result=0;
+  do{b=str.charCodeAt(index++)-63;result|=(b&31)<<shift;shift+=5}while(b>=32);
+  lng+=(result&1)?~(result>>1):(result>>1); out.push([lat/factor,lng/factor]);
+ } return out;
+}
+async function calculate(){
+ if(!startPos) return;
+ $('route').disabled=true;$('start').disabled=true;setStatus('Route wird berechnet…','warn');$('summary').innerHTML='';
+ try{
+  const d=await geocode($('dest').value);
+  const body={
+   locations:[{lat:startPos.lat,lon:startPos.lon},{lat:d.lat,lon:d.lon}],
+   costing:'truck',
+   costing_options:{truck:{height:4.0,width:2.55,length:16.5,weight:40}},
+   units:'kilometers',language:'de-DE',directions_options:{units:'kilometers'}
+  };
+  const r=await fetch('https://valhalla.openstreetmap.de/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok) throw Error('Routing-Server antwortet nicht ('+r.status+')');
+  const data=await r.json(), leg=data.trip.legs[0];
+  routeCoords=decode(leg.shape,6); maneuvers=leg.maneuvers||[];
+  if(routeLine) map.removeLayer(routeLine);
+  routeLine=L.polyline(routeCoords,{weight:6}).addTo(map); map.fitBounds(routeLine.getBounds(),{padding:[30,30]});
+  const km=data.trip.summary.length, min=Math.round(data.trip.summary.time/60);
+  $('summary').innerHTML='<b>🟢 Route: '+km.toFixed(1)+' km · ca. '+min+' min</b><br>40-t-Profil an Routing übergeben. Verkehrszeichen vor Ort haben Vorrang.';
+  setStatus('Route bereit. Navigation kann gestartet werden.','ok'); $('start').disabled=false;
+ }catch(e){setStatus(e.message,'bad')}
+ finally{$('route').disabled=false}
+}
+$('route').onclick=calculate;
+
+function hav(a,b,c,d){
+ const R=6371000,p=Math.PI/180,x=(c-a)*p,y=(d-b)*p*Math.cos((a+c)*p/2); return R*Math.sqrt(x*x+y*y);
+}
+function nearestIndex(lat,lon){
+ let best=0,bd=Infinity;
+ for(let i=0;i<routeCoords.length;i+=Math.max(1,Math.floor(routeCoords.length/500))){
+  const d=hav(lat,lon,routeCoords[i][0],routeCoords[i][1]); if(d<bd){bd=d;best=i}
+ } return [best,bd];
+}
+function speak(text,i){
+ if(!voiceOn||i===lastSpoken||!('speechSynthesis'in window))return;
+ lastSpoken=i; speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text);u.lang='de-DE';speechSynthesis.speak(u);
+}
+function updateNav(p){
+ const lat=p.coords.latitude,lon=p.coords.longitude;
+ if(marker) marker.setLatLng([lat,lon]); else marker=L.marker([lat,lon]).addTo(map);
+ const [idx,off]=nearestIndex(lat,lon);
+ if(!userMoved) map.panTo([lat,lon],{animate:true,duration:.35});
+ let mi=0;
+ for(let i=0;i<maneuvers.length;i++){if((maneuvers[i].begin_shape_index??0)>=idx){mi=i;break}}
+ const m=maneuvers[mi]||{};
+ const target=routeCoords[Math.min(m.begin_shape_index??idx,routeCoords.length-1)];
+ const meters=target?hav(lat,lon,target[0],target[1]):0;
+ $('next').textContent=m.instruction||'Route folgen';
+ $('dist').textContent=(meters>1000?(meters/1000).toFixed(1)+' km':Math.round(meters)+' m')+(off>120?' · ⚠️ Route verlassen':'');
+ if(meters<350) speak(m.verbal_pre_transition_instruction||m.instruction||'',mi);
+}
+function startNav(){
+ if(!startPos||!routeCoords.length){setStatus('Erst Standort und Route berechnen.','bad');return}
+ navigating=true;userMoved=false;$('drive').style.display='block';
+ setStatus('Navigation läuft.','ok');
+ watchId=navigator.geolocation.watchPosition(updateNav,e=>setStatus('GPS-Fehler: '+e.message,'bad'),{enableHighAccuracy:true,maximumAge:1000,timeout:12000});
+}
+$('start').onclick=startNav;
+map.on('dragstart zoomstart',()=>{if(navigating)userMoved=true});
+$('center').onclick=()=>{userMoved=false;if(marker)map.setView(marker.getLatLng(),16)};
+$('voice').onclick=()=>{voiceOn=!voiceOn;$('voice').textContent=voiceOn?'🔊':'🔇';if(!voiceOn)speechSynthesis.cancel()};
+$('stop').onclick=()=>{navigating=false;if(watchId!==null)navigator.geolocation.clearWatch(watchId);watchId=null;$('drive').style.display='none';speechSynthesis?.cancel();setStatus('Navigation beendet.','');};
+if('serviceWorker'in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
+</script>
+</body></html>
