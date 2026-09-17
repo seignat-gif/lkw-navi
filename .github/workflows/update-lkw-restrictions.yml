@@ -1,0 +1,110 @@
+name: LKW-Beschraenkungen aktualisieren
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install osmium
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool
+
+      - name: Download current Germany OSM data
+        run: curl -L --retry 3 -o germany.osm.pbf https://download.geofabrik.de/europe/germany-latest.osm.pbf
+
+      - name: Extract truck restrictions
+        run: |
+          osmium tags-filter germany.osm.pbf \
+            n/hgv w/hgv n/goods w/goods \
+            n/maxheight w/maxheight n/maxheight:physical w/maxheight:physical \
+            n/maxwidth w/maxwidth n/maxlength w/maxlength \
+            n/maxweight w/maxweight n/maxweightrating w/maxweightrating \
+            n/maxweightrating:hgv w/maxweightrating:hgv \
+            -o truck.osm.pbf --overwrite
+          osmium export truck.osm.pbf -o raw.geojson --overwrite
+
+      - name: Build map files
+        run: |
+          python3 - <<'PY'
+          import json, math, shutil
+          from pathlib import Path
+
+          out = Path('restrictions')
+          if out.exists():
+              shutil.rmtree(out)
+          out.mkdir()
+
+          data = json.load(open('raw.geojson', encoding='utf-8'))
+
+          keys = (
+              'hgv', 'goods', 'maxheight', 'maxheight:physical',
+              'maxwidth', 'maxlength', 'maxweight',
+              'maxweightrating', 'maxweightrating:hgv'
+          )
+
+          buckets = {}
+
+          def point(g):
+              if not g:
+                  return None
+              c = g.get('coordinates')
+              t = g.get('type')
+              if t == 'Point':
+                  return c
+              if t == 'LineString' and c:
+                  return c[len(c)//2]
+              if t == 'MultiLineString' and c and c[0]:
+                  return c[0][len(c[0])//2]
+              return None
+
+          for f in data.get('features', []):
+              p = point(f.get('geometry'))
+              props = f.get('properties') or {}
+              tags = {k: str(props[k]) for k in keys if k in props}
+
+              if not p or not tags:
+                  continue
+
+              lon, lat = float(p[0]), float(p[1])
+              key = f'{math.floor(lon)}_{math.floor(lat)}'
+
+              buckets.setdefault(key, []).append({
+                  'type': 'Feature',
+                  'geometry': {
+                      'type': 'Point',
+                      'coordinates': [lon, lat]
+                  },
+                  'properties': tags
+              })
+
+          for key, features in buckets.items():
+              (out / f'{key}.geojson').write_text(
+                  json.dumps({
+                      'type': 'FeatureCollection',
+                      'features': features
+                  }, ensure_ascii=False, separators=(',', ':')),
+                  encoding='utf-8'
+              )
+
+          print('tiles', len(buckets))
+          print('restrictions', sum(map(len, buckets.values())))
+          PY
+
+      - name: Commit generated map data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add restrictions
+          git diff --cached --quiet && exit 0
+          git commit -m "Update LKW restriction map data"
+          git push
