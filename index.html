@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>LKW Navi 40t – v0.7</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html,body,#map{height:100%;margin:0} body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#eef1f4}
+.panel{position:absolute;z-index:1000;top:max(12px,env(safe-area-inset-top));left:12px;right:12px;background:white;border-radius:18px;padding:14px;box-shadow:0 5px 22px #0003;max-width:520px}
+h1{font-size:20px;margin:0 0 4px}.profile{font-size:13px;color:#555;margin-bottom:10px}
+.row{display:flex;gap:8px;margin-top:8px} input{box-sizing:border-box;width:100%;padding:11px;border:1px solid #ccd2d8;border-radius:10px;font-size:16px}
+button{border:0;border-radius:10px;padding:11px 13px;font-weight:700;font-size:15px}.primary{background:#111;color:#fff;flex:1}.secondary{background:#e9edf1}
+#status{font-size:13px;margin-top:9px;line-height:1.35}.warn{color:#9a5a00}.ok{color:#176b35}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#edf1f5;margin-right:4px}
+
+.navbox{display:none;position:absolute;z-index:1100;left:12px;right:12px;bottom:max(14px,env(safe-area-inset-bottom));background:white;border-radius:18px;padding:13px;box-shadow:0 5px 22px #0003;max-width:520px}
+.navtop{font-size:22px;font-weight:800}.navsub{font-size:14px;margin-top:4px}.navactions{display:flex;gap:8px;margin-top:9px}.navactions button{flex:1}
+</style>
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#ffffff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="LKW Navi">
+<link rel="apple-touch-icon" href="./icon-192.png">
+</head>
+<body>
+<div id="map"></div>
+<div class="navbox" id="navbox">
+ <div class="navtop" id="navnext">Navigation bereit</div>
+ <div style="font-size:32px;font-weight:900;margin-top:4px" id="turnmeter"></div>
+ <div class="navsub" id="navdist">Route berechnen und Navigation starten.</div>
+ <div class="navactions"><button class="secondary" id="voice">🔊 Sprache an</button><button class="secondary" id="stopnav">■ Beenden</button></div>
+</div>
+<div class="panel">
+  <h1>🚛 LKW NAVI <small style="font-size:11px">v0.7</small></h1>
+  <div class="profile"><span class="badge">40 t</span><span class="badge">4,00 m</span><span class="badge">2,55 m</span><span class="badge">16,50 m</span></div>
+  <input id="dest" value="Am Graben 16, 97355 Kleinlangheim" placeholder="Ziel">
+  <div class="row">
+    <button class="secondary" id="gps">📍 Standort</button>
+    <button class="primary" id="route">Route berechnen</button></div><div class="row"><button class="primary" id="startnav">▶ Navigation starten</button>
+  </div>
+  <div id="status" class="warn">Prototyp: noch nicht als alleinige Lkw-Navigation verwenden.</div>
+    <div id="legend" style="font-size:12px;margin-top:7px">
+      🟢 Route &nbsp; 🟡 prüfen &nbsp; 🔴 bekannte Beschränkung
+    </div>
+    <details style="font-size:12px;margin-top:8px"><summary>Fahrzeugprofil / Sicherheit</summary>
+      <div style="margin-top:6px">Sattelzug: 40 t · 4,00 m · 2,55 m · 16,50 m. Bekannte OSM-Beschränkungen werden zusätzlich entlang der Route abgefragt. Fehlende Kartendaten bleiben ein Risiko.</div>
+    </details>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+function hav(a,b){
+ const R=6371000, p1=a[0]*Math.PI/180,p2=b[0]*Math.PI/180,dp=(b[0]-a[0])*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180;
+ const x=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+ return 2*R*Math.asin(Math.sqrt(x));
+}
+function nearestRouteDistance(lat,lon){
+ if(!routePts.length)return Infinity;
+ let best=Infinity;
+ for(let i=0;i<routePts.length;i+=Math.max(1,Math.floor(routePts.length/600))) best=Math.min(best,hav([lat,lon],routePts[i]));
+ return best;
+}
+function speak(t){
+ if(!voiceOn || !('speechSynthesis' in window)) return;
+ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.lang='de-DE'; speechSynthesis.speak(u);
+}
+document.getElementById('voice').onclick=()=>{
+ voiceOn=!voiceOn; document.getElementById('voice').textContent=voiceOn?'🔊 Sprache an':'🔇 Sprache aus';
+};
+document.getElementById('stopnav').onclick=()=>{
+ if(watchId!==null) navigator.geolocation.clearWatch(watchId); watchId=null;
+ document.getElementById('navbox').style.display='none';
+};
+document.getElementById('startnav').onclick=()=>{
+ if(!routePts.length){status.textContent='Bitte zuerst eine Route berechnen.';return;}
+ if(!navigator.geolocation){status.textContent='GPS wird nicht unterstützt.';return;}
+ document.getElementById('navbox').style.display='block';
+ speak('LKW Navigation gestartet');
+ if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+ watchId=navigator.geolocation.watchPosition(async p=>{
+   const lat=p.coords.latitude,lon=p.coords.longitude;
+   setStart(lat,lon);
+   if(routeLine) map.fitBounds(routeLine.getBounds(),{padding:[55,55]});
+   let idx=0,best=Infinity;
+   routePts.forEach((q,i)=>{const d=hav([lat,lon],q);if(d<best){best=d;idx=i;}});
+   const remaining=haversineAlong(routePts,idx);
+
+   // Find next Valhalla maneuver using its begin_shape_index when available.
+   let mi=routeManeuvers.findIndex(m=>(m.begin_shape_index ?? 0)>idx);
+   if(mi<0) mi=routeManeuvers.length-1;
+   const m=routeManeuvers[mi];
+   let instruction=m?.instruction || 'Weiter auf der Lkw-Route';
+   let mdist=0;
+   if(m && m.begin_shape_index!=null){
+      const target=Math.min(routePts.length-1,m.begin_shape_index);
+      for(let k=idx+1;k<=target;k++) mdist+=hav(routePts[k-1],routePts[k]);
+   }
+   document.getElementById('navnext').textContent='🚛 '+instruction;
+   document.getElementById('turnmeter').textContent=mdist>1000?(mdist/1000).toFixed(1)+' km':Math.max(0,Math.round(mdist/10)*10)+' m';
+   document.getElementById('navdist').textContent='Reststrecke '+(remaining/1000).toFixed(1)+' km · GPS ±'+Math.round(p.coords.accuracy)+' m';
+
+   // Speak maneuver at useful thresholds, once per maneuver/threshold.
+   const threshold=mdist<=120?120:mdist<=500?500:mdist<=1000?1000:null;
+   if(threshold){
+      const key=mi+'-'+threshold;
+      if(lastSpoken!==key){
+        lastSpoken=key;
+        speak((mdist>150?'In '+Math.round(mdist/50)*50+' Metern. ':'')+instruction);
+      }
+   }
+
+   // Warn about known restriction points within 1 km.
+   let rw=restrictionPoints.map(x=>({...x,d:hav([lat,lon],[x.lat,x.lon])}))
+      .filter(x=>x.d<1000).sort((a,b)=>a.d-b.d)[0];
+   if(rw && rw.bad){
+      document.getElementById('navdist').innerHTML='🔴 <b>LKW-WARNUNG in '+Math.round(rw.d/10)*10+' m:</b> '+rw.text+
+        '<br>Reststrecke '+(remaining/1000).toFixed(1)+' km';
+      const key='r-'+Math.round(rw.lat*10000)+'-'+(rw.d<250?'near':'far');
+      if(lastSpoken!==key){lastSpoken=key;speak('Achtung. LKW Beschränkung voraus. '+rw.text);}
+   }
+   if(best>120 && Date.now()-lastReroute>30000){
+      lastReroute=Date.now();
+      document.getElementById('navnext').textContent='↻ Route verlassen – Neuberechnung';
+      speak('Route verlassen. Route wird neu berechnet.');
+      document.getElementById('route').click();
+   }
+ },e=>{document.getElementById('navdist').textContent='GPS-Fehler: '+e.message},{enableHighAccuracy:true,maximumAge:2000,timeout:12000});
+};
+function haversineAlong(pts,startIndex){
+ let d=0; for(let i=startIndex+1;i<pts.length;i++)d+=hav(pts[i-1],pts[i]); return d;
+}
+
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+}
+
+// v0.7 navigation UI fixes
+let voiceEnabled=true, userMovedMap=false;
+const driveControls=document.getElementById('driveControls');
+const recenterBtn=document.getElementById('recenterBtn');
+const voiceBtn=document.getElementById('voiceBtn');
+map.on('dragstart zoomstart',()=>{if(navigating) userMovedMap=true;});
+recenterBtn.onclick=()=>{userMovedMap=false;if(currentPos) map.setView([currentPos.lat,currentPos.lon],16);};
+voiceBtn.onclick=()=>{voiceEnabled=!voiceEnabled;voiceBtn.textContent=voiceEnabled?'🔊':'🔇';if(!voiceEnabled&&window.speechSynthesis)speechSynthesis.cancel();};
+if(window.speechSynthesis){
+ const oldSpeak=speechSynthesis.speak.bind(speechSynthesis);
+ speechSynthesis.speak=(u)=>{if(voiceEnabled) oldSpeak(u);};
+}
+navigator.geolocation?.watchPosition(p=>{
+ if(navigating&&!userMovedMap) map.panTo([p.coords.latitude,p.coords.longitude],{animate:true,duration:.5});
+},()=>{},{enableHighAccuracy:true,maximumAge:1000,timeout:10000});
+document.getElementById('navstart')?.addEventListener('click',()=>{
+ setTimeout(()=>{if(navigating){driveControls.style.display='flex';userMovedMap=false;}},200);
+});
+</script>
+<script>
+const map=L.map('map').setView([49.75,10.15],10);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
+ maxZoom:19, attribution:'© OpenStreetMap contributors'
+}).addTo(map);
+
+let start=null, startMarker=null, destMarker=null, routeLine=null, routePts=[], routeManeuvers=[], watchId=null, voiceOn=true, lastSpoken=-1, lastReroute=0, restrictionPoints=[];
+const status=document.getElementById('status');
+function setStart(lat,lon){
+ start={lat,lon};
+ if(startMarker) map.removeLayer(startMarker);
+ startMarker=L.marker([lat,lon]).addTo(map).bindPopup('Start').openPopup();
+ if(!navigating) map.setView([lat,lon],13);
+ status.textContent='Startposition gesetzt.';
+ status.className='ok';
+}
+document.getElementById('gps').onclick=()=>{
+ if(!navigator.geolocation){status.textContent='GPS wird von diesem Browser nicht unterstützt.';return}
+ status.textContent='Standort wird bestimmt…';
+ navigator.geolocation.getCurrentPosition(
+   p=>setStart(p.coords.latitude,p.coords.longitude),
+   e=>{status.textContent='Standort konnte nicht bestimmt werden: '+e.message;status.className='warn'},
+   {enableHighAccuracy:true,timeout:12000}
+ );
+};
+async function geocode(q){
+ const u='https://nominatim.openstreetmap.org/search?format=json&limit=1&q='+encodeURIComponent(q);
+ const r=await fetch(u,{headers:{'Accept':'application/json'}});
+ const j=await r.json(); if(!j.length) throw new Error('Ziel nicht gefunden');
+ return {lat:+j[0].lat,lon:+j[0].lon,name:j[0].display_name};
+}
+
+function decodePolyline6(str){
+  let index=0, lat=0, lon=0, coordinates=[];
+  while(index<str.length){
+    let b, shift=0, result=0;
+    do { b=str.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; } while(b>=0x20);
+    let dlat=(result&1)?~(result>>1):(result>>1); lat+=dlat;
+    shift=0; result=0;
+    do { b=str.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; } while(b>=0x20);
+    let dlon=(result&1)?~(result>>1):(result>>1); lon+=dlon;
+    coordinates.push([lat/1e6,lon/1e6]);
+  }
+  return coordinates;
+}
+
+
+function parseMetric(v){
+  if(v==null) return null;
+  let m=String(v).trim().match(/^([0-9]+(?:[.,][0-9]+)?)/);
+  return m ? parseFloat(m[1].replace(',','.')) : null;
+}
+function pointSegDist(p,a,b){
+  const x=p[1], y=p[0], x1=a[1], y1=a[0], x2=b[1], y2=b[0];
+  const dx=x2-x1, dy=y2-y1;
+  const t=Math.max(0,Math.min(1,((x-x1)*dx+(y-y1)*dy)/(dx*dx+dy*dy||1)));
+  const xx=x1+t*dx, yy=y1+t*dy;
+  const ky=111.32, kx=111.32*Math.cos(y*Math.PI/180);
+  return Math.hypot((x-xx)*kx,(y-yy)*ky);
+}
+function nearRoute(lat,lon,pts,km=.12){
+  for(let i=1;i<pts.length;i++) if(pointSegDist([lat,lon],pts[i-1],pts[i])<=km) return true;
+  return false;
+}
+async function inspectRestrictions(pts){
+  if(!pts.length) return [];
+  const lats=pts.map(x=>x[0]), lons=pts.map(x=>x[1]);
+  const pad=.006;
+  const south=Math.min(...lats)-pad, west=Math.min(...lons)-pad, north=Math.max(...lats)+pad, east=Math.max(...lons)+pad;
+  const q=`[out:json][timeout:25];(
+    way["highway"]["hgv"](${south},${west},${north},${east});
+    way["highway"]["maxweight"](${south},${west},${north},${east});
+    way["highway"]["maxweightrating"](${south},${west},${north},${east});
+    way["highway"]["maxheight"](${south},${west},${north},${east});
+    way["highway"]["maxwidth"](${south},${west},${north},${east});
+    way["highway"]["maxlength"](${south},${west},${north},${east});
+    node["maxheight"](${south},${west},${north},${east});
+    node["maxweight"](${south},${west},${north},${east});
+    node["maxwidth"](${south},${west},${north},${east});
+  );out tags center;`;
+  const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:q});
+  if(!r.ok) throw new Error('Beschränkungsprüfung derzeit nicht erreichbar');
+  const j=await r.json();
+  return (j.elements||[]).filter(e=>{
+    const lat=e.lat ?? e.center?.lat, lon=e.lon ?? e.center?.lon;
+    return lat!=null && nearRoute(lat,lon,pts,.18);
+  });
+}
+function classifyRestriction(t){
+  let reasons=[], bad=false;
+  if(t.hgv==='no'){bad=true; reasons.push('Lkw-Verbot');}
+  const mw=parseMetric(t.maxweight); if(mw!==null && mw<40){bad=true;reasons.push('max. '+mw+' t tatsächliches Gewicht');}
+  const mwr=parseMetric(t.maxweightrating); if(mwr!==null && mwr<40){bad=true;reasons.push('zGG max. '+mwr+' t');}
+  const mh=parseMetric(t.maxheight); if(mh!==null && mh<4){bad=true;reasons.push('Höhe max. '+mh+' m');}
+  const mwi=parseMetric(t.maxwidth); if(mwi!==null && mwi<2.55){bad=true;reasons.push('Breite max. '+mwi+' m');}
+  const ml=parseMetric(t.maxlength); if(ml!==null && ml<16.5){bad=true;reasons.push('Länge max. '+ml+' m');}
+  if(['destination','delivery','local'].includes(t.hgv)) reasons.push('Lkw nur '+t.hgv);
+  return {bad,reasons};
+}
+
+document.getElementById('route').onclick=async()=>{
+ try{
+  if(!start) throw new Error('Bitte zuerst „Standort“ drücken.');
+  status.textContent='Ziel wird gesucht…'; status.className='';
+  const d=await geocode(document.getElementById('dest').value);
+  if(destMarker) map.removeLayer(destMarker);
+  destMarker=L.marker([d.lat,d.lon]).addTo(map).bindPopup('Ziel');
+  status.textContent='Route wird berechnet…';
+  const req={
+   locations:[{lat:start.lat,lon:start.lon},{lat:d.lat,lon:d.lon}],
+   costing:"truck",
+   costing_options:{truck:{
+     height:4.0,width:2.55,length:16.5,weight:40.0,
+     use_highways:0.9,use_tolls:0.7
+   }},
+   units:"kilometers",language:"de-DE",directions_options:{units:"kilometers"}
+  };
+  const r=await fetch('https://valhalla1.openstreetmap.de/route',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(req)
+  });
+  if(!r.ok) {
+    let detail=''; try { detail=await r.text(); } catch(_){}
+    throw new Error('Routingserver meldet HTTP '+r.status+(detail?' – '+detail.slice(0,120):''));
+  }
+  const j=await r.json();
+  const s=j.trip.summary;
+  let pts=[];
+  for(const leg of j.trip.legs || []) {
+    if(leg.shape) pts = pts.concat(decodePolyline6(leg.shape));
+  }
+  if(routeLine) map.removeLayer(routeLine);
+  if(pts.length){
+    routeLine=L.polyline(pts,{weight:6,opacity:.85}).addTo(map);
+    map.fitBounds(routeLine.getBounds(),{padding:[40,40]});
+  } else {
+    map.fitBounds([[start.lat,start.lon],[d.lat,d.lon]],{padding:[40,40]});
+  }
+  routePts=pts; const maneuvers=(j.trip.legs||[]).flatMap(x=>x.maneuvers||[]); routeManeuvers=maneuvers;
+  const steps=maneuvers.slice(0,5).map(m=>'• '+(m.instruction||'Weiter')+(m.length?' ('+m.length.toFixed(1)+' km)':'')).join('<br>');
+  let safety='<b>🟡 Zusatzprüfung:</b> wird geladen…';
+  status.innerHTML='<b>🟢 Lkw-Route:</b> '+s.length.toFixed(1)+' km · ca. '+Math.round(s.time/60)+' min'
+    +(steps?'<br><br><b>Erste Hinweise:</b><br>'+steps:'')+'<br><br>'+safety;
+  status.className='ok';
+  try{
+    const restrictions=await inspectRestrictions(pts);
+    const findings=restrictions.map(e=>({e,c:classifyRestriction(e.tags||{})})).filter(x=>x.c.reasons.length);
+    restrictionPoints=findings.map(x=>({
+      lat:x.e.lat ?? x.e.center?.lat, lon:x.e.lon ?? x.e.center?.lon,
+      bad:x.c.bad, text:x.c.reasons.join(', ')
+    })).filter(x=>x.lat!=null && x.lon!=null);
+    restrictionPoints.forEach(x=>{
+      L.circleMarker([x.lat,x.lon],{radius:8,weight:3,fillOpacity:.75})
+       .addTo(map).bindPopup((x.bad?'🔴 ':'🟡 ')+x.text);
+    });
+    const bad=findings.filter(x=>x.c.bad);
+    if(bad.length){
+      const txt=bad.slice(0,8).map(x=>'🔴 '+x.c.reasons.join(', ')+' — '+(x.e.tags.name||'Straßenabschnitt')).join('<br>');
+      status.innerHTML += '<br><br><b>🔴 Bekannte Konflikte nahe der Route:</b><br>'+txt;
+    } else {
+      status.innerHTML += '<br><br><b>🟢 Keine offensichtliche eingetragene 40-t/4-m-Konfliktstelle nahe der berechneten Route gefunden.</b>';
+    }
+    const conditional=findings.filter(x=>!x.c.bad);
+    if(conditional.length){
+      status.innerHTML += '<br>'+conditional.slice(0,5).map(x=>'🟡 '+x.c.reasons.join(', ')+' — '+(x.e.tags.name||'Straßenabschnitt')).join('<br>');
+    }
+  }catch(err){
+    status.innerHTML += '<br><br>🟡 Zusatzprüfung nicht verfügbar: '+err.message;
+  }
+  status.innerHTML += '<br><br>⚠️ Keine Freigabe-Garantie: OSM kann Beschilderung fehlen. Verkehrszeichen und behördliche Anordnungen vor Ort haben Vorrang.';
+ }catch(e){
+  const msg=(e && e.message) ? e.message : String(e);
+  status.innerHTML='<b>Route konnte nicht berechnet werden.</b><br>'+msg+
+    '<br><small>GPS ist davon unabhängig. Falls „Load failed“ erscheint, ist der Routingdienst vom Browser nicht erreichbar.</small>';
+  status.className='warn';
+}
+};
+
+function hav(a,b){
+ const R=6371000, p1=a[0]*Math.PI/180,p2=b[0]*Math.PI/180,dp=(b[0]-a[0])*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180;
+ const x=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+ return 2*R*Math.asin(Math.sqrt(x));
+}
+function nearestRouteDistance(lat,lon){
+ if(!routePts.length)return Infinity;
+ let best=Infinity;
+ for(let i=0;i<routePts.length;i+=Math.max(1,Math.floor(routePts.length/600))) best=Math.min(best,hav([lat,lon],routePts[i]));
+ return best;
+}
+function speak(t){
+ if(!voiceOn || !('speechSynthesis' in window)) return;
+ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.lang='de-DE'; speechSynthesis.speak(u);
+}
+document.getElementById('voice').onclick=()=>{
+ voiceOn=!voiceOn; document.getElementById('voice').textContent=voiceOn?'🔊 Sprache an':'🔇 Sprache aus';
+};
+document.getElementById('stopnav').onclick=()=>{
+ if(watchId!==null) navigator.geolocation.clearWatch(watchId); watchId=null;
+ document.getElementById('navbox').style.display='none';
+};
+document.getElementById('startnav').onclick=()=>{
+ if(!routePts.length){status.textContent='Bitte zuerst eine Route berechnen.';return;}
+ if(!navigator.geolocation){status.textContent='GPS wird nicht unterstützt.';return;}
+ document.getElementById('navbox').style.display='block';
+ speak('LKW Navigation gestartet');
+ if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+ watchId=navigator.geolocation.watchPosition(async p=>{
+   const lat=p.coords.latitude,lon=p.coords.longitude;
+   setStart(lat,lon);
+   if(routeLine) map.fitBounds(routeLine.getBounds(),{padding:[55,55]});
+   let idx=0,best=Infinity;
+   routePts.forEach((q,i)=>{const d=hav([lat,lon],q);if(d<best){best=d;idx=i;}});
+   const remaining=haversineAlong(routePts,idx);
+
+   // Find next Valhalla maneuver using its begin_shape_index when available.
+   let mi=routeManeuvers.findIndex(m=>(m.begin_shape_index ?? 0)>idx);
+   if(mi<0) mi=routeManeuvers.length-1;
+   const m=routeManeuvers[mi];
+   let instruction=m?.instruction || 'Weiter auf der Lkw-Route';
+   let mdist=0;
+   if(m && m.begin_shape_index!=null){
+      const target=Math.min(routePts.length-1,m.begin_shape_index);
+      for(let k=idx+1;k<=target;k++) mdist+=hav(routePts[k-1],routePts[k]);
+   }
+   document.getElementById('navnext').textContent='🚛 '+instruction;
+   document.getElementById('turnmeter').textContent=mdist>1000?(mdist/1000).toFixed(1)+' km':Math.max(0,Math.round(mdist/10)*10)+' m';
+   document.getElementById('navdist').textContent='Reststrecke '+(remaining/1000).toFixed(1)+' km · GPS ±'+Math.round(p.coords.accuracy)+' m';
+
+   // Speak maneuver at useful thresholds, once per maneuver/threshold.
+   const threshold=mdist<=120?120:mdist<=500?500:mdist<=1000?1000:null;
+   if(threshold){
+      const key=mi+'-'+threshold;
+      if(lastSpoken!==key){
+        lastSpoken=key;
+        speak((mdist>150?'In '+Math.round(mdist/50)*50+' Metern. ':'')+instruction);
+      }
+   }
+
+   // Warn about known restriction points within 1 km.
+   let rw=restrictionPoints.map(x=>({...x,d:hav([lat,lon],[x.lat,x.lon])}))
+      .filter(x=>x.d<1000).sort((a,b)=>a.d-b.d)[0];
+   if(rw && rw.bad){
+      document.getElementById('navdist').innerHTML='🔴 <b>LKW-WARNUNG in '+Math.round(rw.d/10)*10+' m:</b> '+rw.text+
+        '<br>Reststrecke '+(remaining/1000).toFixed(1)+' km';
+      const key='r-'+Math.round(rw.lat*10000)+'-'+(rw.d<250?'near':'far');
+      if(lastSpoken!==key){lastSpoken=key;speak('Achtung. LKW Beschränkung voraus. '+rw.text);}
+   }
+   if(best>120 && Date.now()-lastReroute>30000){
+      lastReroute=Date.now();
+      document.getElementById('navnext').textContent='↻ Route verlassen – Neuberechnung';
+      speak('Route verlassen. Route wird neu berechnet.');
+      document.getElementById('route').click();
+   }
+ },e=>{document.getElementById('navdist').textContent='GPS-Fehler: '+e.message},{enableHighAccuracy:true,maximumAge:2000,timeout:12000});
+};
+function haversineAlong(pts,startIndex){
+ let d=0; for(let i=startIndex+1;i<pts.length;i++)d+=hav(pts[i-1],pts[i]); return d;
+}
+
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+}
+
+// v0.7 navigation UI fixes
+let voiceEnabled=true, userMovedMap=false;
+const driveControls=document.getElementById('driveControls');
+const recenterBtn=document.getElementById('recenterBtn');
+const voiceBtn=document.getElementById('voiceBtn');
+map.on('dragstart zoomstart',()=>{if(navigating) userMovedMap=true;});
+recenterBtn.onclick=()=>{userMovedMap=false;if(currentPos) map.setView([currentPos.lat,currentPos.lon],16);};
+voiceBtn.onclick=()=>{voiceEnabled=!voiceEnabled;voiceBtn.textContent=voiceEnabled?'🔊':'🔇';if(!voiceEnabled&&window.speechSynthesis)speechSynthesis.cancel();};
+if(window.speechSynthesis){
+ const oldSpeak=speechSynthesis.speak.bind(speechSynthesis);
+ speechSynthesis.speak=(u)=>{if(voiceEnabled) oldSpeak(u);};
+}
+navigator.geolocation?.watchPosition(p=>{
+ if(navigating&&!userMovedMap) map.panTo([p.coords.latitude,p.coords.longitude],{animate:true,duration:.5});
+},()=>{},{enableHighAccuracy:true,maximumAge:1000,timeout:10000});
+document.getElementById('navstart')?.addEventListener('click',()=>{
+ setTimeout(()=>{if(navigating){driveControls.style.display='flex';userMovedMap=false;}},200);
+});
+</script>
+<div id="driveControls" style="position:fixed;right:14px;bottom:28px;z-index:1600;display:none;gap:8px;flex-direction:column">
+<button id="recenterBtn" style="width:54px;height:54px;border-radius:27px;font-size:22px;padding:0">🎯</button>
+<button id="voiceBtn" style="width:54px;height:54px;border-radius:27px;font-size:22px;padding:0">🔊</button>
+</div></body>
+</html>
