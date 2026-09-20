@@ -1,1 +1,1 @@
-{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.9260871,55.4608774]},"properties":{"hgv":"yes","goods":"yes"}},{"type":"Feature","geometry":{"type":"Point","coordinates":[10.984268,55.0915331]},"properties":{"hgv":"yes","goods":"yes"}}]}
+{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.984268,55.0915331]},"properties":{"hgv":"yes","goods":"yes"}}]}
